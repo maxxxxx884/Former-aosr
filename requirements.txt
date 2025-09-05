@@ -1,0 +1,16 @@
+openpyxl
+gigachat
+groq
+google-generativeai
+openai
+tkinterdnd2
+docxtpl
+docx2pdf
+PyPDF2
+pymupdf
+Pillow
+tqdm
+pywin32; platform_system == "Windows"
+
+# Optional for packaging (project contains a PyInstaller hook)
+# pyinstaller
