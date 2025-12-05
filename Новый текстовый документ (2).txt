@@ -1,6 +1,1 @@
-pyinstaller --onefile --noconsole --add-data "АОСР.docx;." ^
-  --hidden-import tkinterdnd2 ^
-  --hidden-import _tkinter ^
-  --additional-hooks-dir=. ^
-  main.py
-
+pyinstaller pretty_gui.py --additional-hooks-dir=. --onefile --windowed --name="DocumentProcessor" --hidden-import=tkinterdnd2 --hidden-import=docxtpl --hidden-import=docx2pdf --hidden-import=openpyxl --hidden-import=PyPDF2 --hidden-import=fitz --hidden-import=PIL --hidden-import=pythoncom --hidden-import=appdirs --hidden-import=tqdm --add-data="path_manager.py;."

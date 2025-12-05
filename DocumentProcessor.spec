@@ -5,9 +5,9 @@ a = Analysis(
     ['pretty_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('*.dll', '.')],
-    hiddenimports=[],
-    hookspath=[],
+    datas=[('path_manager.py', '.')],
+    hiddenimports=['tkinterdnd2', 'docxtpl', 'docx2pdf', 'openpyxl', 'PyPDF2', 'fitz', 'PIL', 'pythoncom', 'appdirs', 'tqdm'],
+    hookspath=['.'],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
@@ -35,5 +35,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['icon.ico'],
 )

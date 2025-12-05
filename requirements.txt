@@ -11,6 +11,7 @@ pymupdf
 Pillow
 tqdm
 pywin32; platform_system == "Windows"
+appdirs
 
 # Optional for packaging (project contains a PyInstaller hook)
 # pyinstaller

@@ -1,28 +1,14 @@
 import os
-import re
-import sys
-import shutil
-import threading
 import tkinter as tk
 from tkinter import messagebox, ttk, filedialog
 from tkinterdnd2 import DND_FILES, TkinterDnD
-import pythoncom  # Инициализация COM
-from datetime import datetime
-from docxtpl import DocxTemplate
-from docx2pdf import convert
 from openpyxl import load_workbook
-from PyPDF2 import PdfReader, PdfWriter
-import fitz
-import time
-from tqdm import tqdm
-from PIL import Image
+from openpyxl.utils import get_column_letter
+from path_manager import PathManager
 
 
 def is_filled(value):
-    """
-    Проверяет, что значение не является пустым.
-    Возвращает False для None, пустых строк и строк из одних пробелов.
-    """
+    """Проверяет, что значение не является пустым"""
     if value is None:
         return False
     if isinstance(value, str) and value.strip() == "":
@@ -30,61 +16,187 @@ def is_filled(value):
     return True
 
 
-def image_to_pdf(image_path, pdf_path, a4_size=(595, 842)):
-    """
-    Конвертирует изображение в PDF с правильным масштабированием под A4
-    """
-    try:
-        print(f"🖼️ Конвертация изображения в PDF: {os.path.basename(image_path)}")
+class KS2Processor:
+    """Класс для обработки вставки проектной сметы в шаблон КС-2"""
 
-        # Открываем изображение
-        img = Image.open(image_path)
+    def __init__(self, template_path, source_path, output_path):
+        self.template_path = template_path
+        self.source_path = source_path
+        self.output_path = output_path
 
-        # Конвертируем в RGB если необходимо (для PNG с прозрачностью)
-        if img.mode in ('RGBA', 'LA', 'P'):
-            # Создаем белый фон
-            background = Image.new('RGB', img.size, (255, 255, 255))
-            if img.mode == 'P':
-                img = img.convert('RGBA')
-            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-            img = background
-        elif img.mode != 'RGB':
-            img = img.convert('RGB')
+    def find_ks2_sheet(self, workbook):
+        """Находит лист, начинающийся с 'КС-2'"""
+        for sheet_name in workbook.sheetnames:
+            if sheet_name.startswith("КС-2"):
+                return workbook[sheet_name]
+        raise ValueError("Не найден лист, начинающийся с 'КС-2'")
 
-        img_width, img_height = img.size
+    def get_table_dimensions(self, source_sheet):
+        """Определяет размеры таблицы из исходного файла"""
+        max_row = 0
+        max_col = 0
 
-        # Вычисляем масштаб для вписывания в A4 с сохранением пропорций
-        scale_x = a4_size[0] / img_width
-        scale_y = a4_size[1] / img_height
-        scale = min(scale_x, scale_y)
+        for row in source_sheet.iter_rows():
+            for cell in row:
+                if cell.value is not None:
+                    max_row = max(max_row, cell.row)
+                    max_col = max(max_col, cell.column)
 
-        # Новые размеры с учетом масштаба
-        new_width = int(img_width * scale)
-        new_height = int(img_height * scale)
+        return max_row, max_col
 
-        # Создаем PDF документ
-        pdf_doc = fitz.open()
-        page = pdf_doc.new_page(width=a4_size[0], height=a4_size[1])
+    def shift_rows(self, sheet, start_row, rows_to_insert):
+        """Сдвигает строки вниз начиная с start_row"""
+        print(f"  Сдвиг строк с {start_row} на {rows_to_insert} позиций вниз...")
 
-        # Центрируем изображение на странице
-        x_offset = (a4_size[0] - new_width) / 2
-        y_offset = (a4_size[1] - new_height) / 2
+        # Получаем максимальную используемую строку
+        max_row = sheet.max_row
 
-        # Создаем прямоугольник для размещения изображения
-        rect = fitz.Rect(x_offset, y_offset, x_offset + new_width, y_offset + new_height)
+        # Сдвигаем строки снизу вверх, чтобы избежать перезаписи
+        for row_idx in range(max_row, start_row - 1, -1):
+            for col_idx in range(1, sheet.max_column + 1):
+                source_cell = sheet.cell(row=row_idx, column=col_idx)
+                target_cell = sheet.cell(row=row_idx + rows_to_insert, column=col_idx)
 
-        # Вставляем изображение
-        page.insert_image(rect, filename=image_path)
+                # Копируем значение
+                target_cell.value = source_cell.value
 
-        # Сохраняем PDF
-        pdf_doc.save(pdf_path)
-        pdf_doc.close()
+                # Копируем форматирование
+                if source_cell.has_style:
+                    target_cell.font = source_cell.font.copy()
+                    target_cell.border = source_cell.border.copy()
+                    target_cell.fill = source_cell.fill.copy()
+                    target_cell.number_format = source_cell.number_format
+                    target_cell.protection = source_cell.protection.copy()
+                    target_cell.alignment = source_cell.alignment.copy()
 
-        print(f"   ✅ Изображение конвертировано в PDF")
+        # Очищаем освободившиеся строки
+        for row_idx in range(start_row, start_row + rows_to_insert):
+            for col_idx in range(1, sheet.max_column + 1):
+                sheet.cell(row=row_idx, column=col_idx).value = None
 
-    except Exception as e:
-        print(f"   ❌ Ошибка конвертации изображения {image_path}: {str(e)}")
-        raise
+    def shift_range_left(self, sheet, range_start, range_end, columns_to_shift):
+        """
+        Сдвигает диапазон ячеек влево на указанное количество столбцов
+        range_start, range_end: кортежи (строка, столбец)
+        """
+        print(f"  Сдвиг диапазона {get_column_letter(range_start[1])}{range_start[0]}:" +
+              f"{get_column_letter(range_end[1])}{range_end[0]} влево на {columns_to_shift} столбцов...")
+
+        for row_idx in range(range_start[0], range_end[0] + 1):
+            for col_idx in range(range_start[1], range_end[1] + 1):
+                source_cell = sheet.cell(row=row_idx, column=col_idx)
+                target_col = col_idx - columns_to_shift
+
+                if target_col >= 1:  # Проверяем, что не выходим за границы
+                    target_cell = sheet.cell(row=row_idx, column=target_col)
+
+                    # Копируем значение
+                    target_cell.value = source_cell.value
+
+                    # Копируем форматирование
+                    if source_cell.has_style:
+                        target_cell.font = source_cell.font.copy()
+                        target_cell.border = source_cell.border.copy()
+                        target_cell.fill = source_cell.fill.copy()
+                        target_cell.number_format = source_cell.number_format
+                        target_cell.protection = source_cell.protection.copy()
+                        target_cell.alignment = source_cell.alignment.copy()
+
+                # Очищаем исходную ячейку
+                source_cell.value = None
+
+    def insert_table(self, target_sheet, source_sheet, start_row=20):
+        """Вставляет таблицу из source_sheet в target_sheet начиная со start_row"""
+        print(f"  Вставка таблицы начиная со строки {start_row}...")
+
+        # Получаем размеры исходной таблицы
+        source_rows, source_cols = self.get_table_dimensions(source_sheet)
+        print(f"  Размеры вставляемой таблицы: {source_rows} строк × {source_cols} столбцов")
+
+        # Копируем данные
+        for row_idx in range(1, source_rows + 1):
+            for col_idx in range(1, source_cols + 1):
+                source_cell = source_sheet.cell(row=row_idx, column=col_idx)
+                target_cell = target_sheet.cell(row=start_row + row_idx - 1, column=col_idx)
+
+                # Копируем значение
+                target_cell.value = source_cell.value
+
+                # Копируем форматирование
+                if source_cell.has_style:
+                    target_cell.font = source_cell.font.copy()
+                    target_cell.border = source_cell.border.copy()
+                    target_cell.fill = source_cell.fill.copy()
+                    target_cell.number_format = source_cell.number_format
+                    target_cell.protection = source_cell.protection.copy()
+                    target_cell.alignment = source_cell.alignment.copy()
+
+        return source_rows, source_cols
+
+    def process(self):
+        """Основной метод обработки"""
+        print("🚀 === НАЧАЛО ОБРАБОТКИ ===\n")
+        print(f"📄 Шаблон: {os.path.basename(self.template_path)}")
+        print(f"📊 Исходные данные: {os.path.basename(self.source_path)}")
+
+        try:
+            # Загружаем файлы
+            print("\n📥 Загрузка файлов...")
+            template_wb = load_workbook(self.template_path)
+            source_wb = load_workbook(self.source_path)
+
+            # Находим нужные листы
+            ks2_sheet = self.find_ks2_sheet(template_wb)
+            source_sheet = source_wb.active
+
+            print(f"✅ Найден лист шаблона: '{ks2_sheet.title}'")
+            print(f"✅ Используется исходный лист: '{source_sheet.title}'")
+
+            # Получаем размеры вставляемой таблицы
+            source_rows, source_cols = self.get_table_dimensions(source_sheet)
+
+            # 1. Сдвигаем строки в шаблоне
+            print(f"\n🔄 Сдвиг строк в шаблоне...")
+            self.shift_rows(ks2_sheet, start_row=20, rows_to_insert=source_rows)
+
+            # 2. Вставляем таблицу
+            print(f"\n📋 Вставка данных...")
+            inserted_rows, inserted_cols = self.insert_table(ks2_sheet, source_sheet, start_row=20)
+
+            # 3. Проверяем, нужно ли сдвигать области G1:H18 и E12:F18
+            # Столбец H это 8-й столбец
+            if inserted_cols > 8:
+                columns_to_shift = inserted_cols - 8
+                print(f"\n⬅️  Вставленная таблица выходит за столбец H")
+                print(f"  Необходимо сдвинуть области влево на {columns_to_shift} столбцов")
+
+                # Сдвигаем область G1:H18 (столбцы 7-8, строки 1-18)
+                self.shift_range_left(ks2_sheet,
+                                      range_start=(1, 7),
+                                      range_end=(18, 8),
+                                      columns_to_shift=columns_to_shift)
+
+                # Сдвигаем область E12:F18 (столбцы 5-6, строки 12-18)
+                self.shift_range_left(ks2_sheet,
+                                      range_start=(12, 5),
+                                      range_end=(18, 6),
+                                      columns_to_shift=columns_to_shift)
+            else:
+                print(f"\n✅ Вставленная таблица заканчивается на столбце {get_column_letter(inserted_cols)}")
+                print(f"  Сдвиг областей G1:H18 и E12:F18 не требуется")
+
+            # Сохраняем результат
+            print(f"\n💾 Сохранение результата...")
+            template_wb.save(self.output_path)
+
+            print(f"\n🎉 === ОБРАБОТКА ЗАВЕРШЕНА ===")
+            print(f"✅ Результат сохранен: {os.path.basename(self.output_path)}")
+
+            return True
+
+        except Exception as e:
+            print(f"\n❌ Ошибка: {str(e)}")
+            raise
 
 
 class ToolTip:
@@ -118,109 +230,148 @@ class ToolTip:
             self.tooltip = None
 
 
-def choose_files_and_folders(parent, callback):
-    """
-    Улучшенное окно для выбора входных данных с исправленной валидацией
-    """
-    root = tk.Toplevel(parent)
-    root.title("🔧 Настройка параметров обработки документов")
-    root.geometry("1000x900")
-    root.resizable(True, True)
+class KS2Application:
+    """Главное приложение с GUI"""
 
-    # Настройка стилей
-    style = ttk.Style()
-    style.theme_use('clam')
+    def __init__(self):
+        self.root = TkinterDnD.Tk()
+        self.root.title("📊 Вставка проектной сметы в КС-2")
+        self.root.geometry("800x800")
 
-    # Переменные для хранения путей и флагов
-    passports_folder = tk.StringVar()
-    lab_folder = tk.StringVar()
-    executive_folder = tk.StringVar()
-    output_folder = tk.StringVar()
-    excel_file = tk.StringVar()
-    word_template = tk.StringVar()
-    double_sided_print = tk.BooleanVar(value=True)
-    black_and_white = tk.BooleanVar()
+        # Инициализация менеджера путей
+        self.path_manager = PathManager()
+        saved_paths = self.path_manager.load_paths()
 
-    # Переменные для валидации
-    validation_vars = {
-        'passports': tk.BooleanVar(),
-        'lab': tk.BooleanVar(),
-        'executive': tk.BooleanVar(),
-        'output': tk.BooleanVar(),
-        'excel': tk.BooleanVar(),
-        'word': tk.BooleanVar()
-    }
+        # Переменные для путей
+        self.template_path = tk.StringVar(value=saved_paths.get("ks2_template", ""))
+        self.source_path = tk.StringVar(value=saved_paths.get("source_file", ""))
+        self.output_path = tk.StringVar(value=saved_paths.get("output_file", ""))
 
-    # Главный заголовок
-    header_frame = ttk.Frame(root)
-    header_frame.pack(fill=tk.X, padx=20, pady=(20, 10))
+        # Переменные валидации
+        self.validation_vars = {
+            'template': tk.BooleanVar(),
+            'source': tk.BooleanVar(),
+            'output': tk.BooleanVar()
+        }
 
-    title_label = ttk.Label(header_frame, text="📄 Система автоматической обработки документов",
-                            font=("Arial", 16, "bold"))
-    title_label.pack()
+        self.setup_ui()
 
-    subtitle_label = ttk.Label(header_frame, text="Выберите папки и файлы для обработки",
-                               font=("Arial", 10))
-    subtitle_label.pack()
+        # Валидация после загрузки
+        self.root.after(100, lambda: [
+            self.validate_path(self.template_path, self.validation_vars['template'], True),
+            self.validate_path(self.source_path, self.validation_vars['source'], True),
+            self.validate_path(self.output_path, self.validation_vars['output'], False)
+        ])
 
-    # Создаем Notebook для вкладок
-    notebook = ttk.Notebook(root)
-    notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+    def setup_ui(self):
+        """Создание интерфейса"""
+        # Настройка стилей
+        style = ttk.Style()
+        style.theme_use('clam')
 
-    # Вкладка 1: Основные настройки
-    main_frame = ttk.Frame(notebook)
-    notebook.add(main_frame, text="📁 Основные настройки")
+        # Заголовок
+        header_frame = ttk.Frame(self.root)
+        header_frame.pack(fill=tk.X, padx=20, pady=(20, 10))
 
-    def on_drop(event, var, validation_var=None):
-        file_path = event.data.strip('{}')
-        if is_filled(file_path) and os.path.exists(file_path):
-            var.set(file_path)
-            if validation_var:
-                validation_var.set(True)
-                update_submit_button()
+        title_label = ttk.Label(header_frame,
+                                text="📊 Вставка проектной сметы в шаблон КС-2",
+                                font=("Arial", 16, "bold"))
+        title_label.pack()
 
-    def validate_path(var, validation_var, is_file=False):
-        """Проверяет существование пути и обновляет индикатор с улучшенной валидацией"""
-        path = var.get()
+        subtitle_label = ttk.Label(header_frame,
+                                   text="Автоматическая вставка данных с учетом форматирования",
+                                   font=("Arial", 10))
+        subtitle_label.pack()
 
-        # Проверяем, что путь не пустой и не состоит из пробелов
-        if not is_filled(path):
-            validation_var.set(False)
-            update_submit_button()
-            return
+        # Основная область
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
 
-        # Проверяем существование пути
-        if os.path.exists(path):
-            if is_file and os.path.isfile(path):
-                validation_var.set(True)
-            elif not is_file and os.path.isdir(path):
-                validation_var.set(True)
-            else:
-                validation_var.set(False)
-        else:
-            validation_var.set(False)
+        # Секции выбора файлов
+        self.create_file_section(main_frame,
+                                 "📄 Шаблон КС-2",
+                                 "Файл Excel с шаблоном КС-2 (лист должен начинаться с 'КС-2')",
+                                 self.template_path,
+                                 self.validation_vars['template'])
 
-        update_submit_button()
+        self.create_file_section(main_frame,
+                                 "📊 Проектная смета",
+                                 "Файл Excel с проектной сметой для вставки",
+                                 self.source_path,
+                                 self.validation_vars['source'])
 
-    def create_path_section(parent, title, description, variable, select_type,
-                            validation_var, filetypes=None, tooltip_text=""):
-        """Создает секцию для выбора пути с улучшенным дизайном"""
+        self.create_file_section(main_frame,
+                                 "💾 Файл результата",
+                                 "Путь для сохранения обработанного файла",
+                                 self.output_path,
+                                 self.validation_vars['output'],
+                                 is_output=True)
 
-        # Основная рамка секции
+        # Информационная панель
+        info_frame = ttk.LabelFrame(main_frame, text="ℹ️ Информация", padding=(15, 10))
+        info_frame.pack(fill=tk.BOTH, expand=True, pady=(20, 0))
+
+        info_text = tk.Text(info_frame, height=8, wrap=tk.WORD, font=("Arial", 9))
+        info_text.pack(fill=tk.BOTH, expand=True)
+
+        info_content = """Программа выполняет следующие действия:
+
+1. 📥 Загружает шаблон КС-2 и файл с проектной сметой
+2. 🔍 Находит лист, начинающийся с 'КС-2' в шаблоне
+3. 📏 Определяет размеры вставляемой таблицы
+4. ⬇️  Сдвигает строки в шаблоне начиная с 20-й на высоту таблицы
+5. 📋 Вставляет данные из проектной сметы с сохранением форматирования
+6. ⬅️  При необходимости сдвигает области G1:H18 и E12:F18 влево
+7. 💾 Сохраняет результат в указанный файл
+
+💡 Важно: Все форматирование (шрифты, границы, заливка) сохраняется!"""
+
+        info_text.insert(tk.END, info_content)
+        info_text.config(state=tk.DISABLED)
+
+        # Нижняя панель
+        bottom_frame = ttk.Frame(self.root)
+        bottom_frame.pack(fill=tk.X, padx=20, pady=(0, 20))
+
+        # Статус
+        self.status_label = ttk.Label(bottom_frame,
+                                      text="📋 Заполните все поля",
+                                      font=("Arial", 10))
+        self.status_label.pack(side=tk.LEFT)
+
+        # Кнопки
+        button_frame = ttk.Frame(bottom_frame)
+        button_frame.pack(side=tk.RIGHT)
+
+        self.process_btn = ttk.Button(button_frame,
+                                      text="🚀 Обработать",
+                                      command=self.process_files,
+                                      state='disabled')
+        self.process_btn.pack(side=tk.LEFT, padx=(10, 5))
+
+        exit_btn = ttk.Button(button_frame,
+                              text="❌ Выход",
+                              command=self.root.quit)
+        exit_btn.pack(side=tk.LEFT, padx=5)
+
+        # Горячие клавиши
+        self.root.bind('<Return>', lambda e: self.process_files() if self.process_btn['state'] == 'normal' else None)
+        self.root.bind('<Escape>', lambda e: self.root.quit())
+
+    def create_file_section(self, parent, title, description, variable, validation_var, is_output=False):
+        """Создает секцию для выбора файла"""
         section_frame = ttk.LabelFrame(parent, text=title, padding=(10, 5))
-        section_frame.pack(fill=tk.X, padx=10, pady=8)
+        section_frame.pack(fill=tk.X, pady=8)
 
         # Описание
-        if description:
-            desc_label = ttk.Label(section_frame, text=description,
-                                   font=("Arial", 9), foreground="gray")
-            desc_label.pack(anchor="w")
+        desc_label = ttk.Label(section_frame, text=description,
+                               font=("Arial", 9), foreground="gray")
+        desc_label.pack(anchor="w")
 
-        # Рамка для поля ввода и кнопок
+        # Поле ввода
         input_frame = ttk.Frame(section_frame)
         input_frame.pack(fill=tk.X, pady=(5, 0))
 
-        # Поле ввода
         entry = ttk.Entry(input_frame, textvariable=variable, font=("Arial", 9))
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -230,919 +381,180 @@ def choose_files_and_folders(parent, callback):
 
         # Кнопка обзора
         def browse():
-            if select_type == 'folder':
-                path = filedialog.askdirectory(parent=parent, title=title)
+            if is_output:
+                path = filedialog.asksaveasfilename(
+                    parent=self.root,
+                    title=title,
+                    defaultextension=".xlsx",
+                    filetypes=[('Excel файлы', '*.xlsx'), ('Все файлы', '*.*')]
+                )
             else:
                 path = filedialog.askopenfilename(
-                    parent=parent, title=title,
-                    filetypes=filetypes or [('Все файлы', '*.*')]
+                    parent=self.root,
+                    title=title,
+                    filetypes=[('Excel файлы', '*.xlsx *.xls'), ('Все файлы', '*.*')]
                 )
-            if is_filled(path):  # Проверяем на заполненность
+
+            if is_filled(path):
                 variable.set(path)
-                validate_path(variable, validation_var, select_type == 'file')
+                self.validate_path(variable, validation_var, not is_output)
 
         browse_btn = ttk.Button(input_frame, text="📁 Обзор", command=browse)
         browse_btn.pack(side=tk.LEFT, padx=(5, 0))
 
-        # Поддержка Drag & Drop
+        # Drag & Drop
         entry.drop_target_register(DND_FILES)
-        entry.dnd_bind('<<Drop>>', lambda e: on_drop(e, variable, validation_var))
+        entry.dnd_bind('<<Drop>>', lambda e: self.on_drop(e, variable, validation_var, not is_output))
 
-        # Валидация при изменении текста
-        def on_change(*args):
-            validate_path(variable, validation_var, select_type == 'file')
-
-        variable.trace('w', on_change)
+        # Валидация при изменении
+        variable.trace('w', lambda *args: self.validate_path(variable, validation_var, not is_output))
 
         # Обновление индикатора
-        def update_status():
+        def update_status(*args):
             if validation_var.get():
                 status_label.config(text="✅", foreground="green")
             else:
                 status_label.config(text="❌", foreground="red")
 
-        validation_var.trace('w', lambda *args: update_status())
+        validation_var.trace('w', update_status)
 
-        # Подсказка
-        if tooltip_text:
-            ToolTip(entry, tooltip_text)
+    def on_drop(self, event, var, validation_var, must_exist):
+        """Обработка Drag & Drop"""
+        file_path = event.data.strip('{}')
+        if is_filled(file_path):
+            var.set(file_path)
+            self.validate_path(var, validation_var, must_exist)
 
-        return section_frame
+    def validate_path(self, var, validation_var, must_exist=True):
+        """Валидация пути"""
+        path = var.get()
 
-    # Создаем секции
-    create_path_section(main_frame, "📋 Папка с паспортами",
-                        "Выберите папку, содержащую файлы паспортов материалов (PDF, Word, изображения)",
-                        passports_folder, 'folder', validation_vars['passports'],
-                        tooltip_text="Поддерживаются: PDF, DOCX, DOC, JPG, PNG, BMP, TIFF")
+        if not is_filled(path):
+            validation_var.set(False)
+            self.update_process_button()
+            return
 
-    create_path_section(main_frame, "🔬 Папка с лабораторными заключениями",
-                        "Выберите папку с лабораторными заключениями и сертификатами (PDF, Word, изображения)",
-                        lab_folder, 'folder', validation_vars['lab'],
-                        tooltip_text="Поддерживаются: PDF, DOCX, DOC, JPG, PNG, BMP, TIFF")
+        if must_exist:
+            validation_var.set(os.path.exists(path) and os.path.isfile(path))
+        else:
+            # Для выходного файла проверяем только, что путь валидный
+            validation_var.set(len(path) > 0)
 
-    create_path_section(main_frame, "📐 Папка с исполнительными схемами",
-                        "Выберите папку с исполнительными схемами и чертежами (PDF, Word, изображения)",
-                        executive_folder, 'folder', validation_vars['executive'],
-                        tooltip_text="Поддерживаются: PDF, DOCX, DOC, JPG, PNG, BMP, TIFF")
+        self.update_process_button()
 
-    create_path_section(main_frame, "💾 Папка для результата",
-                        "Выберите папку, куда сохранить обработанные документы",
-                        output_folder, 'folder', validation_vars['output'],
-                        tooltip_text="В эту папку будут сохранены все обработанные файлы")
-
-    create_path_section(main_frame, "📊 Excel-файл с данными",
-                        "Файл Excel с таблицами 'Реквизиты' и 'АСР ТАБЛ'",
-                        excel_file, 'file', validation_vars['excel'],
-                        filetypes=[('Excel файлы', '*.xlsx *.xlsm'), ('Все файлы', '*.*')],
-                        tooltip_text="Файл должен содержать листы 'Реквизиты' и 'АСР ТАБЛ'")
-
-    create_path_section(main_frame, "📝 Шаблон Word документа",
-                        "Шаблон Word для создания АОСР документов",
-                        word_template, 'file', validation_vars['word'],
-                        filetypes=[('Документы Word', '*.docx'), ('Все файлы', '*.*')],
-                        tooltip_text="Шаблон должен содержать переменные для замещения")
-
-    # Вкладка 2: Дополнительные настройки
-    options_frame = ttk.Frame(notebook)
-    notebook.add(options_frame, text="⚙️ Дополнительные настройки")
-
-    # Настройки PDF
-    pdf_frame = ttk.LabelFrame(options_frame, text="🖨️ Настройки PDF", padding=(15, 10))
-    pdf_frame.pack(fill=tk.X, padx=20, pady=20)
-
-    double_sided_cb = ttk.Checkbutton(pdf_frame, text="Двусторонняя печать PDF",
-                                      variable=double_sided_print)
-    double_sided_cb.pack(anchor="w", pady=5)
-    ToolTip(double_sided_cb, "Добавляет пустые страницы для правильной двусторонней печати")
-
-    black_white_cb = ttk.Checkbutton(pdf_frame, text="Конвертировать PDF в черно-белый",
-                                     variable=black_and_white)
-    black_white_cb.pack(anchor="w", pady=5)
-    ToolTip(black_white_cb, "Преобразует цветные PDF в черно-белые для экономии чернил")
-
-    # Информационная панель
-    info_frame = ttk.LabelFrame(options_frame, text="ℹ️ Информация", padding=(15, 10))
-    info_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
-
-    info_text = tk.Text(info_frame, height=10, wrap=tk.WORD, font=("Arial", 9))
-    info_text.pack(fill=tk.BOTH, expand=True)
-
-    info_content = """Программа выполняет следующие действия:
-
-1. 📄 Загружает данные из Excel файла и Word шаблона
-2. 🔄 Для каждой строки в таблице создает заполненный АОСР документ
-3. 📁 Копирует соответствующие паспорта, лабораторные заключения и схемы
-4. 🖼️ Изображения автоматически конвертируются в PDF с правильным масштабированием
-5. 🖨️ Применяет настройки печати (двусторонняя печать, черно-белый режим)
-6. 📋 Объединяет все файлы в один итоговый PDF документ
-
-📝 Поддерживаемые форматы:
-• Документы: PDF, DOCX, DOC  
-• Изображения: JPG, JPEG, PNG, BMP, TIFF
-
-💡 Советы:
-• Убедитесь, что Excel файл содержит листы 'Реквизиты' и 'АСР ТАБЛ'
-• Имена файлов в Excel должны соответствовать файлам в папках (с расширением или без)
-• Используйте точку с запятой (;) для разделения нескольких файлов
-• Изображения будут масштабированы под формат A4 с сохранением пропорций"""
-
-    info_text.insert(tk.END, info_content)
-    info_text.config(state=tk.DISABLED)
-
-    # Нижняя панель с кнопками
-    bottom_frame = ttk.Frame(root)
-    bottom_frame.pack(fill=tk.X, padx=20, pady=(0, 20))
-
-    # Индикатор готовности
-    status_frame = ttk.Frame(bottom_frame)
-    status_frame.pack(side=tk.LEFT)
-
-    status_label = ttk.Label(status_frame, text="📋 Статус: Заполните все поля",
-                             font=("Arial", 10))
-    status_label.pack()
-
-    progress_label = ttk.Label(status_frame, text="", font=("Arial", 9), foreground="gray")
-    progress_label.pack()
-
-    # Кнопки
-    button_frame = ttk.Frame(bottom_frame)
-    button_frame.pack(side=tk.RIGHT)
-
-    def update_submit_button():
-        """Обновляет состояние кнопки подтверждения и статус с улучшенной проверкой"""
-        all_valid = all(var.get() for var in validation_vars.values())
+    def update_process_button(self):
+        """Обновление состояния кнопки обработки"""
+        all_valid = all(var.get() for var in self.validation_vars.values())
 
         if all_valid:
-            submit_btn.config(state='normal')
-            status_label.config(text="✅ Готов к обработке", foreground="green")
-            progress_label.config(text="Все поля заполнены корректно")
+            self.process_btn.config(state='normal')
+            self.status_label.config(text="✅ Готово к обработке", foreground="green")
         else:
-            submit_btn.config(state='disabled')
-            missing = [name for name, var in validation_vars.items() if not var.get()]
-            status_label.config(text="⚠️ Заполните все поля", foreground="orange")
-            progress_label.config(text=f"Не заполнено: {', '.join(missing)}")
-
-    result = []
-
-    def on_submit():
-        # Дополнительная проверка с использованием is_filled
-        paths_to_check = [
-            (passports_folder.get(), "папка с паспортами"),
-            (lab_folder.get(), "папка с лабораторными заключениями"),
-            (executive_folder.get(), "папка с исполнительными схемами"),
-            (output_folder.get(), "папка для результата"),
-            (excel_file.get(), "Excel-файл"),
-            (word_template.get(), "шаблон Word")
-        ]
-
-        empty_fields = []
-        for path, description in paths_to_check:
-            if not is_filled(path):
-                empty_fields.append(description)
-
-        if empty_fields:
-            messagebox.showwarning("Предупреждение",
-                                   f"Следующие поля не заполнены или содержат только пробелы:\n\n" +
-                                   "\n".join(f"• {field}" for field in empty_fields),
-                                   parent=root)
-            return
-
-        # Проверяем существование путей
-        non_existing = []
-        for path, description in paths_to_check:
-            if not os.path.exists(path.strip()):
-                non_existing.append(f"{description}: {path}")
-
-        if non_existing:
-            messagebox.showerror("Ошибка",
-                                 f"Следующие пути не существуют:\n\n" +
-                                 "\n".join(f"• {item}" for item in non_existing),
-                                 parent=root)
-            return
-
-        result.extend([
-            passports_folder.get().strip(),
-            lab_folder.get().strip(),
-            executive_folder.get().strip(),
-            output_folder.get().strip(),
-            excel_file.get().strip(),
-            word_template.get().strip(),
-            double_sided_print.get(),
-            black_and_white.get()
-        ])
-        root.destroy()
-
-    def on_close():
-        callback()
-        root.destroy()
-
-    submit_btn = ttk.Button(button_frame, text="🚀 Начать обработку",
-                            command=on_submit, state='disabled')
-    submit_btn.pack(side=tk.LEFT, padx=(10, 5))
-
-    cancel_btn = ttk.Button(button_frame, text="❌ Отмена", command=on_close)
-    cancel_btn.pack(side=tk.LEFT, padx=5)
-
-    # Привязка горячих клавиш
-    root.bind('<Return>', lambda e: on_submit() if submit_btn['state'] == 'normal' else None)
-    root.bind('<Escape>', lambda e: on_close())
-
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    root.grab_set()
-
-    # Центрирование окна
-    root.update_idletasks()
-    x = (root.winfo_screenwidth() // 2) - (root.winfo_width() // 2)
-    y = (root.winfo_screenheight() // 2) - (root.winfo_height() // 2)
-    root.geometry(f"+{x}+{y}")
-
-    parent.wait_window(root)
-
-    if not result:
-        return None
-    return tuple(result)
-
-
-def clear_output_folder(output_folder):
-    """Очищает папку вывода, перемещая старые файлы в архив"""
-    archive_folder = os.path.join(output_folder, 'архив')
-    if not os.path.exists(archive_folder):
-        os.makedirs(archive_folder)
-
-    moved_files = 0
-    for file_name in os.listdir(output_folder):
-        file_path = os.path.join(output_folder, file_name)
-        if os.path.isfile(file_path):
-            shutil.move(file_path, os.path.join(archive_folder, file_name))
-            moved_files += 1
-
-    if moved_files > 0:
-        print(f'📦 Перемещено {moved_files} старых файлов в архивную папку.')
-
-
-def add_blank_pages(file_path):
-    """Добавляет пустую страницу после каждой страницы PDF для двусторонней печати"""
-    print(f"🖨️ Подготовка к двусторонней печати: {os.path.basename(file_path)}")
-    reader = PdfReader(file_path)
-    writer = PdfWriter()
-
-    for i, page in enumerate(reader.pages):
-        writer.add_page(page)
-        writer.add_blank_page()
-        if (i + 1) % 10 == 0:  # Прогресс каждые 10 страниц
-            print(f"   Обработано страниц: {i + 1}/{len(reader.pages)}")
-
-    with open(file_path, 'wb') as output_file:
-        writer.write(output_file)
-    print(f"✅ Добавлено {len(reader.pages)} пустых страниц")
-
-
-def convert_to_black_and_white(file_path):
-    """Конвертирует PDF в черно-белый и масштабирует под A4"""
-    print(f"🎨 Конвертация в черно-белый: {os.path.basename(file_path)}")
-    doc = fitz.open(file_path)
-    a4_width = 595
-    a4_height = 842
-
-    temp_file = file_path + ".temp"
-    temp_doc = fitz.open()
-
-    for page_number, page in enumerate(doc, start=1):
-        if page_number % 5 == 0:  # Прогресс каждые 5 страниц
-            print(f"   Обработка страницы {page_number} из {len(doc)}...")
-
-        pix = page.get_pixmap(dpi=150)
-        pix = fitz.Pixmap(fitz.csGRAY, pix)
-
-        img_width, img_height = pix.width, pix.height
-        scale_x = a4_width / img_width
-        scale_y = a4_height / img_height
-        scale = min(scale_x, scale_y)
-
-        scaled_width = img_width * scale
-        scaled_height = img_height * scale
-        x_offset = (a4_width - scaled_width) / 2
-        y_offset = (a4_height - scaled_height) / 2
-
-        new_page = temp_doc.new_page(width=a4_width, height=a4_height)
-        new_rect = fitz.Rect(x_offset, y_offset, x_offset + scaled_width, y_offset + scaled_height)
-        new_page.insert_image(new_rect, stream=pix.tobytes("png"))
-
-    temp_doc.save(temp_file, garbage=3, deflate=True)
-    temp_doc.close()
-    doc.close()
-    os.replace(temp_file, file_path)
-    print("✅ Конвертация завершена")
-
-
-def copy_and_rename_files(source_folder, file_names_str, start_index, prefix,
-                          double_sided_print, black_and_white, output_folder):
-    """Копирует и переименовывает файлы с заданным префиксом, поддерживая документы и изображения"""
-    new_files = []
-
-    # Поддерживаемые расширения
-    document_extensions = ['.docx', '.doc', '.pdf']
-    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
-    all_extensions = document_extensions + image_extensions
-
-    # Исправленная проверка заполненности строки с именами файлов
-    if not is_filled(file_names_str):
-        return new_files, start_index
-
-    # Фильтруем пустые имена файлов и имена из одних пробелов
-    file_names = [name.strip() for name in file_names_str.split(';') if is_filled(name)]
-
-    if not file_names:  # Если после фильтрации не осталось файлов
-        return new_files, start_index
-
-    max_retries = 3
-    retry_delay = 2
-
-    print(f"📁 Копирование файлов категории '{prefix}' ({len(file_names)} файлов)")
-
-    for file_name in file_names:
-        if is_filled(file_name):
-            found = False
-
-            # Проверяем, есть ли уже расширение в имени файла
-            file_name_lower = file_name.lower()
-            has_extension = any(file_name_lower.endswith(ext) for ext in all_extensions)
-
-            if has_extension:
-                # Если расширение уже есть, ищем файл как есть
-                source_path = os.path.join(source_folder, file_name)
-                if os.path.exists(source_path):
-                    # Извлекаем расширение для нового имени
-                    name_without_ext = os.path.splitext(file_name)[0]
-                    extension = os.path.splitext(file_name)[1]
-
-                    new_file_name = f"{start_index:03d}_{prefix}_{name_without_ext}{extension}"
-                    dest_path = os.path.join(output_folder, new_file_name)
-
-                    for attempt in range(max_retries):
-                        try:
-                            shutil.copy2(source_path, dest_path)
-                            print(f"   ✅ {new_file_name}")
-
-                            # Обработка изображений - конвертируем в PDF
-                            if extension.lower() in image_extensions:
-                                pdf_dest_path = dest_path.replace(extension, '.pdf')
-                                image_to_pdf(dest_path, pdf_dest_path)
-                                os.remove(dest_path)  # Удаляем оригинальное изображение
-                                dest_path = pdf_dest_path
-                                new_file_name = new_file_name.replace(extension, '.pdf')
-
-                            # Обработка PDF
-                            if dest_path.lower().endswith('.pdf'):
-                                if black_and_white:
-                                    convert_to_black_and_white(dest_path)
-                                if double_sided_print:
-                                    add_blank_pages(dest_path)
-
-                            new_files.append(os.path.basename(dest_path))
-                            start_index += 1
-                            found = True
-                            break
-
-                        except (PermissionError, OSError) as e:
-                            if attempt < max_retries - 1:
-                                print(f"   ⚠️ Ошибка при копировании {file_name}. Повтор через {retry_delay} сек...")
-                                time.sleep(retry_delay)
-                            else:
-                                print(f"   ❌ Не удалось скопировать {file_name}: {str(e)}")
-                else:
-                    print(f"   ❌ Файл не найден: {file_name}")
-            else:
-                # Если расширения нет, пробуем добавить все поддерживаемые расширения
-                for ext in all_extensions:
-                    source_path = os.path.join(source_folder, file_name + ext)
-                    if os.path.exists(source_path):
-                        new_file_name = f"{start_index:03d}_{prefix}_{file_name}{ext}"
-                        dest_path = os.path.join(output_folder, new_file_name)
-
-                        for attempt in range(max_retries):
-                            try:
-                                shutil.copy2(source_path, dest_path)
-                                print(f"   ✅ {new_file_name}")
-
-                                # Обработка изображений - конвертируем в PDF
-                                if ext.lower() in image_extensions:
-                                    pdf_dest_path = dest_path.replace(ext, '.pdf')
-                                    image_to_pdf(dest_path, pdf_dest_path)
-                                    os.remove(dest_path)  # Удаляем оригинальное изображение
-                                    dest_path = pdf_dest_path
-                                    new_file_name = new_file_name.replace(ext, '.pdf')
-
-                                # Обработка PDF
-                                if dest_path.lower().endswith('.pdf'):
-                                    if black_and_white:
-                                        convert_to_black_and_white(dest_path)
-                                    if double_sided_print:
-                                        add_blank_pages(dest_path)
-
-                                new_files.append(os.path.basename(dest_path))
-                                start_index += 1
-                                found = True
-                                break
-
-                            except (PermissionError, OSError) as e:
-                                if attempt < max_retries - 1:
-                                    print(
-                                        f"   ⚠️ Ошибка при копировании {file_name}{ext}. Повтор через {retry_delay} сек...")
-                                    time.sleep(retry_delay)
-                                else:
-                                    print(f"   ❌ Не удалось скопировать {file_name}{ext}: {str(e)}")
-                        break  # Выходим из цикла расширений, если файл найден
-
-                if not found:
-                    extensions_list = ", ".join(all_extensions)
-                    print(f"   ❌ Файл не найден: {file_name} (проверены расширения: {extensions_list})")
-
-    return new_files, start_index
-
-
-def merge_output_files(output_folder):
-    """Объединяет все файлы из папки вывода в один PDF (включая изображения)"""
-    print("📑 Начало объединения файлов (PDF, DOCX и изображения)...")
-
-    # Поддерживаемые форматы для объединения
-    supported_extensions = ('.pdf', '.docx')
-    image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif')
-
-    # Получаем все файлы для объединения
-    all_files = sorted([f for f in os.listdir(output_folder)
-                        if (f.lower().endswith(supported_extensions + image_extensions))
-                        and not f.startswith('объединенный')])
-
-    if not all_files:
-        print("⚠️ Нет файлов для объединения")
-        return
-
-    merged_pdf = fitz.open()
-
-    with tqdm(total=len(all_files), desc="📄 Объединение", unit="файл",
-              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
-
-        for file in all_files:
-            file_path = os.path.join(output_folder, file)
-
-            try:
-                if file.lower().endswith('.pdf'):
-                    # Обычный PDF файл
-                    pdf_document = fitz.open(file_path)
-                    merged_pdf.insert_pdf(pdf_document)
-                    pdf_document.close()
-
-                elif file.lower().endswith('.docx'):
-                    # Word документ - конвертируем в PDF
-                    print(f"   🔄 Конвертация Word: {file}")
-                    temp_pdf = file_path.replace('.docx', '_temp.pdf')
-                    convert(file_path, temp_pdf)
-                    pdf_document = fitz.open(temp_pdf)
-                    merged_pdf.insert_pdf(pdf_document)
-                    pdf_document.close()
-                    os.remove(temp_pdf)
-
-                elif any(file.lower().endswith(ext) for ext in image_extensions):
-                    # Изображение - конвертируем в PDF
-                    print(f"   🖼️ Конвертация изображения: {file}")
-                    temp_pdf = file_path + '_temp.pdf'
-                    image_to_pdf(file_path, temp_pdf)
-                    pdf_document = fitz.open(temp_pdf)
-                    merged_pdf.insert_pdf(pdf_document)
-                    pdf_document.close()
-                    os.remove(temp_pdf)
-
-                pbar.set_postfix_str(f"Обработан: {file[:30]}...")
-                pbar.update(1)
-
-            except Exception as e:
-                print(f"   ❌ Ошибка обработки {file}: {str(e)}")
-                pbar.update(1)
-
-    merged_file_path = os.path.join(output_folder, "объединенный_документ.pdf")
-    merged_pdf.save(merged_file_path)
-    merged_pdf.close()
-    print(f"🎉 Объединенный документ сохранен: {os.path.basename(merged_file_path)}")
-
-
-def run_processing(passports_folder, lab_folder, executive_folder,
-                   output_folder, excel_file, word_template,
-                   double_sided_print, black_and_white):
-    """Основная функция обработки файлов с поддержкой изображений"""
-    print("🚀 === НАЧАЛО ОБРАБОТКИ ДОКУМЕНТОВ ===")
-    print(f"📅 Время запуска: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
-    print("=" * 50)
-
-    max_retries = 3
-    retry_delay = 2
-
-    try:
-        # Подготовка папки вывода
-        if not os.path.exists(output_folder):
-            os.makedirs(output_folder)
-            print(f"📁 Создана папка вывода: {output_folder}")
-
-        clear_output_folder(output_folder)
-
-        # Загрузка шаблона Word
-        print("\n📝 ЗАГРУЗКА ШАБЛОНА WORD")
-        print("-" * 30)
-        for attempt in range(max_retries):
-            try:
-                print(f"   Загрузка: {os.path.basename(word_template)}")
-                doc_template = DocxTemplate(word_template)
-                print("   ✅ Шаблон Word успешно загружен")
-                break
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    print(f"   ⚠️ Ошибка загрузки. Повтор через {retry_delay} сек...")
-                    time.sleep(retry_delay)
-                else:
-                    raise Exception(f"Не удалось загрузить шаблон Word: {str(e)}")
-
-        # Загрузка Excel
-        print("\n📊 ЗАГРУЗКА EXCEL ФАЙЛА")
-        print("-" * 30)
-        for attempt in range(max_retries):
-            try:
-                print(f"   Загрузка: {os.path.basename(excel_file)}")
-                wb = load_workbook(excel_file, data_only=True)
-                print("   ✅ Excel файл успешно загружен")
-                break
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    print(f"   ⚠️ Ошибка загрузки. Повтор через {retry_delay} сек...")
-                    time.sleep(retry_delay)
-                else:
-                    raise Exception(f"Не удалось загрузить Excel файл: {str(e)}")
-
-        # Загрузка листов
-        try:
-            sheet_requisites = wb["Реквизиты"]
-            sheet_asr = wb['АСР ТАБЛ']
-            print("   ✅ Листы 'Реквизиты' и 'АСР ТАБЛ' найдены")
-        except KeyError as e:
-            raise Exception(f"Отсутствует лист {e} в Excel файле")
-
-        # Настройка столбцов
-        EXCEL_COLUMNS = {
-            'Номер_акта': 'Номер акта',
-            'Имя_работы': 'Наименование работы',
-            'Объем': 'Объем',
-            'Ед_изм': 'Ед.изм.',
-            'Начало_работ': 'Дата начала',
-            'Конец_работ': 'Дата конца',
-            'Дата_составления_акта': 'Дата составления акта',
-            'Материалы': 'Примененные материалы',
-            'Последующие_работы': 'последующие работы',
-            'Проект': 'Проект',
-            'Лабы_по_материалам': 'Лабораторные заключениям',
-            'Паспорта_по_материалам': 'Паспорта по материалам',
-            'Схема': 'Исполнительные схемы',
-            'Паспорта_файлы': 'Имя файлов паспортов',
-            'Исполнительные_схемы': 'Имя файлов схем',
-            'Лабораторные_файлы': 'Имя файлов лаб'
+            self.process_btn.config(state='disabled')
+            self.status_label.config(text="📋 Заполните все поля", foreground="orange")
+
+    def process_files(self):
+        """Запуск обработки файлов"""
+        # Сохраняем пути
+        paths_to_save = {
+            "ks2_template": self.template_path.get().strip(),
+            "source_file": self.source_path.get().strip(),
+            "output_file": self.output_path.get().strip()
         }
+        self.path_manager.save_paths(paths_to_save)
 
-        def find_column_indices(sheet, column_names):
-            """Поиск индексов столбцов с подробным выводом"""
-            column_indices = {}
-            header_row = list(sheet.iter_rows(min_row=1, max_row=1, values_only=True))[0]
+        # Создаем окно прогресса
+        progress_window = tk.Toplevel(self.root)
+        progress_window.title("Обработка...")
+        progress_window.geometry("500x200")
+        progress_window.transient(self.root)
+        progress_window.grab_set()
 
-            print(f"\n🔍 АНАЛИЗ СТРУКТУРЫ EXCEL")
-            print("-" * 30)
-            print(f"   Найдено столбцов: {len([h for h in header_row if is_filled(h)])}")
+        # Центрируем окно
+        progress_window.update_idletasks()
+        x = (progress_window.winfo_screenwidth() // 2) - (progress_window.winfo_width() // 2)
+        y = (progress_window.winfo_screenheight() // 2) - (progress_window.winfo_height() // 2)
+        progress_window.geometry(f"+{x}+{y}")
 
-            for var_name, excel_name in column_names.items():
-                found_index = None
-                for i, cell_value in enumerate(header_row):
-                    if is_filled(cell_value) and str(cell_value).strip().lower() == excel_name.lower():
-                        found_index = i
-                        break
+        # Текстовое поле для вывода
+        text_frame = ttk.Frame(progress_window)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-                if found_index is not None:
-                    column_indices[var_name] = found_index
-                    print(f"   ✅ '{excel_name}' -> колонка {found_index}")
-                else:
-                    column_indices[var_name] = None
-                    print(f"   ❌ '{excel_name}' не найден")
+        text_widget = tk.Text(text_frame, wrap=tk.WORD, font=("Consolas", 9))
+        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-            return column_indices
+        scrollbar = ttk.Scrollbar(text_frame, command=text_widget.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text_widget.config(yscrollcommand=scrollbar.set)
 
-        column_indices = find_column_indices(sheet_asr, EXCEL_COLUMNS)
+        # Перенаправляем print в текстовое поле
+        import sys
+        from io import StringIO
 
-        # Проверка критических столбцов
-        critical_columns = ['Номер_акта', 'Имя_работы']
-        missing_critical = [col for col in critical_columns if column_indices.get(col) is None]
-        if missing_critical:
-            raise Exception(f"Отсутствуют критические столбцы: {missing_critical}")
+        old_stdout = sys.stdout
+        sys.stdout = StringIO()
 
-        # Настройка форматирования дат
-        MONTHS_RU = {
-            1: 'января', 2: 'февраля', 3: 'марта', 4: 'апреля',
-            5: 'мая', 6: 'июня', 7: 'июля', 8: 'августа',
-            9: 'сентября', 10: 'октября', 11: 'ноября', 12: 'декабря'
-        }
+        def update_text():
+            output = sys.stdout.getvalue()
+            text_widget.delete(1.0, tk.END)
+            text_widget.insert(tk.END, output)
+            text_widget.see(tk.END)
+            progress_window.update()
 
-        def format_date(date_obj):
-            if isinstance(date_obj, datetime):
-                return f"{date_obj.day} {MONTHS_RU[date_obj.month]} {date_obj.year} г."
-            return date_obj
-
-        def process_value(value):
-            if not is_filled(value):
-                return ""
-            if isinstance(value, str) and re.match(r'^[A-Z]+\d+$', value.strip()):
-                try:
-                    cell_value = sheet_requisites[value.strip()].value
-                    if not is_filled(cell_value):
-                        print(f"   ⚠️ Пустая ячейка: {value}")
-                        return ""
-                    return format_date(cell_value)
-                except:
-                    print(f"   ❌ Ошибка чтения ячейки: {value}")
-                    return ""
-            return value
-
-        # Обработка реквизитов
-        print(f"\n⚙️ ПОДГОТОВКА РЕКВИЗИТОВ")
-        print("-" * 30)
-        context_requisites = {}
-        template_vars = doc_template.get_undeclared_template_variables()
-
-        for key in template_vars:
-            context_requisites[key] = process_value(key)
-
-        print(f"   ✅ Обработано переменных: {len(context_requisites)}")
-
-        # Подсчет строк для обработки с улучшенной проверкой
-        total_rows = 0
-        work_name_col_index = column_indices.get('Имя_работы', 1)
-
-        for row in sheet_asr.iter_rows(min_row=2):
-            if len(row) > work_name_col_index and is_filled(row[work_name_col_index].value):
-                total_rows += 1
-            else:
-                break
-
-        print(f"\n📋 ОБРАБОТКА СТРОК ДАННЫХ")
-        print("-" * 30)
-        print(f"   Всего строк к обработке: {total_rows}")
-
-        # Основной цикл обработки
-        file_index = 1
-        processed_rows = 0
-
-        for row_num, row in enumerate(sheet_asr.iter_rows(min_row=2, values_only=True), start=2):
-            if not row or len(row) == 0:
-                break
-
-            # Улучшенная проверка наличия данных в строке
-            work_name_col = column_indices.get('Имя_работы')
-            if work_name_col is not None and len(row) > work_name_col:
-                if not is_filled(row[work_name_col]):
-                    break
-            else:
-                break
-
-            processed_rows += 1
-            work_name = str(row[work_name_col]).strip() if is_filled(row[work_name_col]) else "Без названия"
-            print(f"\n   📄 Строка {processed_rows}/{total_rows}: {work_name}")
-
-            # Извлечение данных строки с улучшенной обработкой
-            row_data = {}
-            for var_name, col_index in column_indices.items():
-                try:
-                    if col_index is not None and col_index < len(row):
-                        val = row[col_index]
-                    else:
-                        val = None
-                except IndexError:
-                    val = None
-
-                # Обработка значения с проверкой на заполненность
-                if var_name in ['Начало_работ', 'Конец_работ', 'Дата_составления_акта']:
-                    row_data[var_name] = format_date(val) if is_filled(val) else ""
-                else:
-                    row_data[var_name] = str(val).strip() if is_filled(val) else ""
-
-            # Создание контекста и рендеринг
-            context = {**context_requisites, **row_data}
-            context = {k: (v if is_filled(v) else "") for k, v in context.items()}
-
-            doc_template.render(context)
-            aosr_filename = f"{file_index:03d}_АОСР_заполненный.docx"
-            doc_template.save(os.path.join(output_folder, aosr_filename))
-            print(f"      ✅ Создан документ: {aosr_filename}")
-            file_index += 1
-
-            # Копирование файлов с поддержкой изображений
-            passport_files, file_index = copy_and_rename_files(
-                passports_folder, row_data.get('Паспорта_файлы', ''),
-                file_index, 'Паспорт', double_sided_print, black_and_white, output_folder
-            )
-
-            lab_files, file_index = copy_and_rename_files(
-                lab_folder, row_data.get('Лабораторные_файлы', ''),
-                file_index, 'Лаборатория', double_sided_print, black_and_white, output_folder
-            )
-
-            exec_files, file_index = copy_and_rename_files(
-                executive_folder, row_data.get('Исполнительные_схемы', ''),
-                file_index, 'Исполнительная_схема', double_sided_print, False, output_folder
-            )
-
-            total_copied = len(passport_files) + len(lab_files) + len(exec_files)
-            print(f"      📎 Скопировано файлов: {total_copied}")
-
-        # Финальное объединение
-        print(f"\n🔗 ОБЪЕДИНЕНИЕ ДОКУМЕНТОВ")
-        print("-" * 30)
-        merge_output_files(output_folder)
-
-        # Итоговая статистика
-        print(f"\n🎉 === ОБРАБОТКА ЗАВЕРШЕНА ===")
-        print(f"📊 Статистика:")
-        print(f"   • Обработано строк: {processed_rows}")
-        print(f"   • Создано файлов: {file_index - 1}")
-        print(f"   • Время завершения: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
-        print("=" * 50)
-
-    except Exception as e:
-        print(f"\n💥 КРИТИЧЕСКАЯ ОШИБКА")
-        print("-" * 30)
-        print(f"❌ {str(e)}")
-        messagebox.showerror("Ошибка обработки", f"Произошла ошибка:\n\n{str(e)}")
-
-
-class TextRedirector:
-    """Улучшенный перенаправитель вывода с цветовым выделением"""
-
-    def __init__(self, text_widget):
-        self.text_widget = text_widget
-
-        # Настройка тегов для цветового выделения
-        text_widget.tag_configure("success", foreground="green")
-        text_widget.tag_configure("warning", foreground="orange")
-        text_widget.tag_configure("error", foreground="red")
-        text_widget.tag_configure("info", foreground="blue")
-        text_widget.tag_configure("header", foreground="purple", font=("Arial", 9, "bold"))
-
-    def write(self, text):
-        # Определение типа сообщения и применение соответствующего тега
-        if "✅" in text or "🎉" in text:
-            tag = "success"
-        elif "⚠️" in text or "❌" in text:
-            tag = "warning" if "⚠️" in text else "error"
-        elif "===" in text or "---" in text:
-            tag = "header"
-        elif "🔍" in text or "ℹ️" in text or "📊" in text:
-            tag = "info"
-        else:
-            tag = None
-
-        self.text_widget.insert(tk.END, text, tag)
-        self.text_widget.see(tk.END)
-
-    def flush(self):
-        pass
-
-
-def create_enhanced_log_window(parent, title="📋 Журнал выполнения"):
-    """Создает улучшенное окно логов с прогресс-баром"""
-    log_window = tk.Toplevel(parent)
-    log_window.title(title)
-    log_window.geometry("1200x700")
-    log_window.resizable(True, True)
-
-    # Верхняя панель с информацией
-    top_frame = ttk.Frame(log_window)
-    top_frame.pack(fill=tk.X, padx=10, pady=5)
-
-    ttk.Label(top_frame, text="🔄 Обработка документов в процессе...",
-              font=("Arial", 12, "bold")).pack(side=tk.LEFT)
-
-    # Прогресс-бар (пока что декоративный)
-    progress_frame = ttk.Frame(log_window)
-    progress_frame.pack(fill=tk.X, padx=10, pady=5)
-
-    progress_var = tk.DoubleVar()
-    progress_bar = ttk.Progressbar(progress_frame, mode='indeterminate')
-    progress_bar.pack(fill=tk.X)
-    progress_bar.start(10)  # Анимированный прогресс-бар
-
-    # Область логов
-    log_frame = ttk.LabelFrame(log_window, text="📄 Подробный журнал", padding=5)
-    log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-    text_log = tk.Text(log_frame, width=100, height=30, font=("Consolas", 9))
-    text_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-    scroll_bar = ttk.Scrollbar(log_frame, command=text_log.yview)
-    scroll_bar.pack(side=tk.RIGHT, fill=tk.Y)
-    text_log.configure(yscrollcommand=scroll_bar.set)
-
-    # Нижняя панель с кнопкой
-    bottom_frame = ttk.Frame(log_window)
-    bottom_frame.pack(fill=tk.X, padx=10, pady=5)
-
-    def save_log():
-        """Сохранение лога в файл"""
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Текстовые файлы", "*.txt"), ("Все файлы", "*.*")]
-        )
-        if filename:
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(text_log.get(1.0, tk.END))
-            messagebox.showinfo("Сохранение", f"Журнал сохранен в:\n{filename}")
-
-    ttk.Button(bottom_frame, text="💾 Сохранить журнал",
-               command=save_log).pack(side=tk.LEFT)
-
-    status_label = ttk.Label(bottom_frame, text="Готов к работе...",
-                             font=("Arial", 9))
-    status_label.pack(side=tk.RIGHT)
-
-    return log_window, text_log, progress_bar, status_label
-
-
-def main(parent, callback):
-    """Главная функция с улучшенным интерфейсом"""
-    # Выбор настроек
-    selection = choose_files_and_folders(parent, callback)
-    if selection is None:
-        callback()
-        return
-
-    (passports_folder, lab_folder, executive_folder, output_folder,
-     excel_file, word_template, double_sided_print, black_and_white) = selection
-
-    # Создание улучшенного окна логов
-    log_window, text_log, progress_bar, status_label = create_enhanced_log_window(parent)
-
-    # Перенаправление вывода
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-    sys.stdout = TextRedirector(text_log)
-    sys.stderr = TextRedirector(text_log)
-
-    def restore_output():
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
-
-    def background_job():
-        pythoncom.CoInitialize()
         try:
-            status_label.config(text="⚙️ Обработка выполняется...")
-            run_processing(passports_folder, lab_folder, executive_folder,
-                           output_folder, excel_file, word_template,
-                           double_sided_print, black_and_white)
+            # Создаем процессор
+            processor = KS2Processor(
+                self.template_path.get().strip(),
+                self.source_path.get().strip(),
+                self.output_path.get().strip()
+            )
+
+            # Обновляем GUI во время обработки
+            def process_with_updates():
+                try:
+                    processor.process()
+                    update_text()
+
+                    messagebox.showinfo(
+                        "Успех",
+                        "Обработка успешно завершена!\n\n" +
+                        f"Результат сохранен в:\n{self.output_path.get()}",
+                        parent=progress_window
+                    )
+                except Exception as e:
+                    update_text()
+                    messagebox.showerror(
+                        "Ошибка",
+                        f"Произошла ошибка при обработке:\n\n{str(e)}",
+                        parent=progress_window
+                    )
+                finally:
+                    sys.stdout = old_stdout
+                    progress_window.destroy()
+
+            # Запускаем обработку после отображения окна
+            progress_window.after(100, process_with_updates)
+
         except Exception as e:
-            print(f"💥 Необработанная ошибка: {str(e)}")
-        finally:
-            pythoncom.CoUninitialize()
-            restore_output()
+            sys.stdout = old_stdout
+            progress_window.destroy()
+            messagebox.showerror(
+                "Ошибка",
+                f"Произошла ошибка:\n\n{str(e)}",
+                parent=self.root
+            )
 
-            # Остановка прогресс-бара и финальное уведомление
-            progress_bar.stop()
-            progress_bar.config(mode='determinate', value=100)
-            status_label.config(text="✅ Обработка завершена!")
+    def run(self):
+        """Запуск приложения"""
+        # Центрируем главное окно
+        self.root.update_idletasks()
+        x = (self.root.winfo_screenwidth() // 2) - (self.root.winfo_width() // 2)
+        y = (self.root.winfo_screenheight() // 2) - (self.root.winfo_height() // 2)
+        self.root.geometry(f"+{x}+{y}")
 
-            log_window.after(0, lambda: [
-                messagebox.showinfo("🎉 Успешно!",
-                                    "Обработка документов завершена!\n\n"
-                                    "Проверьте папку вывода для получения результатов.\n"
-                                    "Все изображения были автоматически преобразованы в PDF."),
-                callback(),
-                log_window.destroy()
-            ])
-
-    def on_log_window_close():
-        restore_output()
-        callback()
-        log_window.destroy()
-
-    log_window.protocol("WM_DELETE_WINDOW", on_log_window_close)
-    threading.Thread(target=background_job, daemon=True).start()
+        self.root.mainloop()
 
 
 if __name__ == "__main__":
-    root = TkinterDnD.Tk()
-    root.withdraw()
-    root.title("🏢 Система обработки документов")
-
-    # Центрирование главного окна
-    root.update_idletasks()
-    x = (root.winfo_screenwidth() // 2) - (400 // 2)
-    y = (root.winfo_screenheight() // 2) - (300 // 2)
-    root.geometry(f"400x300+{x}+{y}")
-
-
-    def on_complete():
-        root.quit()
-
-
-    main(root, on_complete)
-    root.mainloop()
+    app = KS2Application()
+    app.run()
